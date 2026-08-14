@@ -744,6 +744,77 @@ class RecapBot(discord.Client):
             description="Show this server's season record, units and ROI for a sport",
             callback=_record))
 
+        # ---- /permcheck
+        async def _permcheck(interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("Admin only.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            guild = interaction.guild
+            me = guild.me if guild else None
+            L = []
+            if me is None:
+                L.append("guild.me is None -- the bot's own member object isn't cached, "
+                         "so permission checks can't run. This is the bug, not your settings.")
+            else:
+                L.append(f"**Bot member:** {me} (id {me.id})")
+                L.append(f"**Its roles:** {', '.join(r.name for r in me.roles)}")
+                gp = me.guild_permissions
+                L.append(f"**Server-wide:** view={gp.view_channel} send={gp.send_messages} "
+                         f"embed={gp.embed_links} history={gp.read_message_history} "
+                         f"admin={gp.administrator}")
+
+            targets = {}
+            for sport in SPORTS:
+                for key, label in ((f"picks_channel_{sport}", f"{sport} picks"),
+                                   (f"recap_channel_{sport}", f"{sport} recap")):
+                    cid = get_config(guild.id, key)
+                    if cid:
+                        targets.setdefault(str(cid), []).append(label)
+            targets.setdefault(str(interaction.channel_id), []).append("you ran this here")
+
+            watch = ("view_channel", "send_messages", "embed_links", "read_message_history")
+            for cid, labels in targets.items():
+                ch = self.get_channel(int(cid))
+                if ch is None:
+                    L.append(f"\n**channel {cid}** ({', '.join(labels)}): NOT VISIBLE to the bot")
+                    continue
+                L.append(f"\n**#{ch.name}** ({', '.join(labels)})")
+                if me is not None:
+                    p = ch.permissions_for(me)
+                    L.append("  computed: " + " ".join(
+                        f"{n.split('_')[0]}={'Y' if getattr(p, n) else 'N'}" for n in watch))
+                    gaps = missing_perms(ch, POST_PERMS)
+                    L.append(f"  bot's own verdict: {'OK to post' if not gaps else 'missing ' + ', '.join(gaps)}")
+                cat = getattr(ch, "category", None)
+                for scope, obj in (("category " + cat.name, cat) if cat else (None, None), \
+                                   ("channel", ch)):
+                    if obj is None:
+                        continue
+                    for target, ow in obj.overwrites.items():
+                        allow, deny = ow.pair()
+                        bits = [f"{n.split('_')[0]}={'ALLOW' if getattr(allow, n) else 'DENY'}"
+                                for n in watch if getattr(allow, n) or getattr(deny, n)]
+                        if bits:
+                            L.append(f"  [{scope}] {getattr(target, 'name', target)}: " + " ".join(bits))
+
+            chunk, out = "", []
+            for line in L:
+                if len(chunk) + len(line) > 1800:
+                    out.append(chunk); chunk = ""
+                chunk += line + "\n"
+            out.append(chunk)
+            for i, part in enumerate(out):
+                if i == 0:
+                    await interaction.followup.send(part, ephemeral=True)
+                else:
+                    await interaction.followup.send(part, ephemeral=True)
+
+        self.tree.add_command(app_commands.Command(
+            name="permcheck",
+            description="ADMIN: dump what Discord actually reports about the bot's permissions",
+            callback=_permcheck))
+
         try:
             synced = await self.tree.sync()
             log.info("Synced %d slash commands", len(synced))
