@@ -250,13 +250,33 @@ def configured_pairs():
 
 # ---------------------------------------------------------------- parsing
 # Risk 1.02 To Win 1U: Tyler Phillips (Marlins) UNDER 14.5 Outs. <noise>
+_NUM = r"\d*\.?\d+"
+# Two stake forms, both real:
+#   "Risk 1U to win .84U."   -> stake and payout both stated
+#   "1U:"                    -> stake only; payout comes from posted odds
 PLAY_RE = re.compile(
-    r"risk\s+(?P<risk>\d*\.?\d+)\s*u?\s+to\s+win\s+(?P<to_win>\d*\.?\d+)\s*u?\s*:?\s*"
+    r"(?:risk\s+(?P<risk>" + _NUM + r")\s*(?:u|units?)?"
+    r"|(?P<risk2>" + _NUM + r")\s*(?:u|units?)\b)"
+    r"(?:\s*(?:to\s+win|@)\s*(?P<to_win>" + _NUM + r")\s*(?:u|units?)?)?"
+    r"[\s.:;,\-\u2013\u2014]*"
     r"(?P<player>[^()\n]+?)\s*\((?P<team>[^)\n]+)\)\s+"
     r"(?P<side>over|under|o|u)\s*(?P<point>\d+(?:\.\d+)?|\.\d+)\s+"
     r"(?P<tail>[^\n]+)",
     re.IGNORECASE,
 )
+
+# American price sitting in the trailing book noise: "FD -115", "+150"
+ODDS_RE = re.compile(r"(?<![\d.])([+-]\d{3,})(?!\d)")
+
+
+def payout_from_odds(risk: float, odds: int) -> float:
+    """Real math on a real posted price -- never a default price."""
+    return risk * (odds / 100.0) if odds > 0 else risk * (100.0 / abs(odds))
+
+
+def extract_odds(tail: str):
+    m = ODDS_RE.search(tail or "")
+    return int(m.group(1)) if m else None
 
 MARKET_MAP = {
     "outs": ("pitching", "outs"),
@@ -294,14 +314,29 @@ def parse_play(text: str):
     m = PLAY_RE.search(text or "")
     if not m:
         return None
-    market_raw = extract_market(m.group("tail"))
+    tail = m.group("tail")
+    market_raw = extract_market(tail)
     if not market_raw:
         return None
     side = m.group("side").lower()
+    risk = float(m.group("risk") or m.group("risk2"))
+
+    # Payout: stated outright, else derived from a posted American price,
+    # else unknown -- and unknown stays unknown. No default price is invented.
+    odds = extract_odds(tail)
+    if m.group("to_win") is not None:
+        to_win, source = float(m.group("to_win")), "stated"
+    elif odds is not None:
+        to_win, source = round(payout_from_odds(risk, odds), 4), f"odds {odds:+d}"
+    else:
+        to_win, source = None, "no price posted"
+
     return {
-        "risk": float(m.group("risk")),
-        "to_win": float(m.group("to_win")),
-        "player": m.group("player").strip(),
+        "risk": risk,
+        "to_win": to_win,
+        "payout_source": source,
+        "odds": odds,
+        "player": m.group("player").strip(" .:;,-\u2013\u2014"),
         "team": m.group("team").strip(),
         "side": "Over" if side in ("over", "o") else "Under",
         "point": float(m.group("point")),
@@ -484,6 +519,15 @@ def grade_wnba_play(play: dict, date_str: str, cache: dict):
 
 
 GRADERS = {"MLB": grade_mlb_play, "WNBA": grade_wnba_play}
+
+
+def settle(risk, to_win, status):
+    """Units for a graded play, or None when the payout was never posted."""
+    if status == "win":
+        return None if to_win is None else to_win
+    if status == "loss":
+        return None if risk is None else -risk
+    return 0 if status == "push" else 0
 
 
 # ---------------------------------------------------------------- permissions
@@ -674,14 +718,14 @@ class RecapBot(discord.Client):
                 row = dict(parsed)
                 status, actual = await asyncio.to_thread(
                     GRADERS[sport.value], row, date_str, {})
-                profit = (parsed["to_win"] if status == "win"
-                          else (-parsed["risk"] if status == "loss" else 0))
+                profit = settle(parsed["risk"], parsed["to_win"], status)
                 with _conn() as c:
                     c.execute("UPDATE plays SET status=?, actual=?, profit=? WHERE message_id=?",
                               (status, actual, profit, mid))
                 if status in COUNTED:
                     act = f" (actual: {actual:g})" if actual is not None else ""
-                    verdict = f"graded **{status}**{act} — {profit:+.2f}u"
+                    units = f"{profit:+.2f}u" if profit is not None else "units unknown (no price posted)"
+                    verdict = f"graded **{status}**{act} — {units}"
                 elif status == "ungraded":
                     verdict = "stored, but I don't know that market — it'll show as couldn't-grade"
                 else:
@@ -690,7 +734,9 @@ class RecapBot(discord.Client):
             await interaction.followup.send(
                 f"📝 Logged for **{date_str}**: {parsed['player']} ({parsed['team']}) "
                 f"{parsed['side']} {parsed['point']:g} {parsed['market']} — "
-                f"risk {parsed['risk']:g}u to win {parsed['to_win']:g}u.\n{verdict}\n"
+                f"risk {parsed['risk']:g}u to win "
+                f"{('%g' % parsed['to_win']) if parsed['to_win'] is not None else '?'}u "
+                f"({parsed['payout_source']}).\n{verdict}\n"
                 f"Run `/recapnow {sport.value.lower()} date:{date_str}` to repost that day's recap.",
                 ephemeral=True)
 
@@ -732,12 +778,14 @@ class RecapBot(discord.Client):
         @app_commands.choices(sport=sport_choices)
         async def _record(interaction: discord.Interaction,
                           sport: app_commands.Choice[str]):
-            wins, losses, pushes, profit, risked = ledger_totals(interaction.guild_id, sport.value)
+            wins, losses, pushes, profit, risked, unpriced = ledger_totals(
+                interaction.guild_id, sport.value)
             roi = f"{profit / risked * 100:+.2f}%" if risked else "—"
+            note = f"\n⚠️ {unpriced} graded play(s) had no posted price — counted in the record, not in units." if unpriced else ""
             await interaction.response.send_message(
                 f"**{sport.value} YTD — {interaction.guild.name}**: {wins}-{losses}"
                 + (f"-{pushes}" if pushes else "")
-                + f" | {profit:+.2f}u | ROI {roi}")
+                + f" | {profit:+.2f}u | ROI {roi}{note}")
 
         self.tree.add_command(app_commands.Command(
             name="record",
@@ -837,17 +885,22 @@ class RecapBot(discord.Client):
 
 
 def ledger_totals(guild_id, sport):
+    """W-L-P counts every graded play. Units only count plays whose payout is
+    known (stated or derived from a posted price) -- a win at an unknown price
+    is a real win but an unknown number of units, and is never summed as zero."""
     with _conn() as c:
         rows = c.execute(
-            "SELECT status, COUNT(*) n, SUM(profit) p, SUM(risk) r FROM plays "
-            "WHERE guild_id=? AND sport=? AND status IN ('win','loss','push') GROUP BY status",
+            "SELECT status, to_win, risk, profit FROM plays "
+            "WHERE guild_id=? AND sport=? AND status IN ('win','loss','push')",
             (str(guild_id), sport)).fetchall()
-    wins = sum(r["n"] for r in rows if r["status"] == "win")
-    losses = sum(r["n"] for r in rows if r["status"] == "loss")
-    pushes = sum(r["n"] for r in rows if r["status"] == "push")
-    profit = sum(r["p"] or 0 for r in rows)
-    risked = sum(r["r"] or 0 for r in rows)
-    return wins, losses, pushes, profit, risked
+    wins = sum(1 for r in rows if r["status"] == "win")
+    losses = sum(1 for r in rows if r["status"] == "loss")
+    pushes = sum(1 for r in rows if r["status"] == "push")
+    priced = [r for r in rows if r["to_win"] is not None]
+    profit = sum(r["profit"] or 0 for r in priced)
+    risked = sum(r["risk"] or 0 for r in priced)
+    unpriced = len(rows) - len(priced)
+    return wins, losses, pushes, profit, risked, unpriced
 
 
 # ---------------------------------------------------------------- scanning
@@ -946,7 +999,7 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
             if r["status"] != "pending" or not r["player"]:
                 continue
             status, actual = await asyncio.to_thread(grader, r, date_str, cache)
-            profit = r["to_win"] if status == "win" else (-r["risk"] if status == "loss" else 0)
+            profit = settle(r["risk"], r["to_win"], status)
             with _conn() as c:
                 c.execute("UPDATE plays SET status=?, actual=?, profit=? WHERE message_id=?",
                           (status, actual, profit, r["message_id"]))
@@ -958,9 +1011,10 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
     repeats = [r for r in rows if r["status"] == "duplicate"]
     wins = sum(1 for r in graded if r["status"] == "win")
     losses = sum(1 for r in graded if r["status"] == "loss")
-    day_profit = sum(r["profit"] or 0 for r in graded)
+    day_profit = sum(r["profit"] or 0 for r in graded if r["to_win"] is not None)
+    unpriced_today = [r for r in graded if r["to_win"] is None]
 
-    _, _, _, ytd, risked = ledger_totals(guild_id, sport)
+    _, _, _, ytd, risked, unpriced_ytd = ledger_totals(guild_id, sport)
     roi = f"{ytd / risked * 100:+.2f}%" if risked else "—"
 
     mm, dd, yy = date_str[5:7].lstrip("0"), date_str[8:10].lstrip("0"), date_str[2:4]
@@ -974,8 +1028,10 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
         mark = {"win": "✅", "loss": "❌", "push": "➖"}[r["status"]]
         actual = f" (actual: {r['actual']:g})" if r["actual"] is not None else ""
         manual = " 📝" if r.get("source") == "manual" else ""
+        units = (f"{r['profit']:+.2f}u" if r["to_win"] is not None
+                 else "units unknown (no price posted)")
         lines.append(f"{mark} {r['player']} {r['side']} {r['point']:g} "
-                     f"{r['market']}{actual} — {r['profit']:+.2f}u{manual}")
+                     f"{r['market']}{actual} — {units}{manual}")
     if lines:
         embed.add_field(name="Plays", value=_fit_lines(lines), inline=False)
     if pending:
@@ -990,6 +1046,12 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
                         value=_fit_lines([f"{r['player']} {r['side']} {r['point']:g} {r['market']}"
                                           for r in repeats]), inline=False)
     embed.add_field(name="💰 Units YTD", value=f"{ytd:+.2f}u", inline=True)
+    if unpriced_today or unpriced_ytd:
+        embed.add_field(
+            name="⚠️ No price posted",
+            value=(f"{len(unpriced_today)} today, {unpriced_ytd} all-time — graded W/L, "
+                   f"left out of units. Post the odds (e.g. `FD -115`) or a "
+                   f"`to win` amount and I'll do the math."), inline=False)
     embed.add_field(name="📈 ROI", value=roi, inline=True)
     if scan_error:
         embed.add_field(name="⚠️ Couldn't read the picks channel",
