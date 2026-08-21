@@ -37,6 +37,7 @@ import re
 import logging
 import asyncio
 import sqlite3
+import difflib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
@@ -149,13 +150,14 @@ def init_db():
                 raw TEXT, player TEXT, team TEXT,
                 side TEXT, point REAL, market TEXT,
                 risk REAL, to_win REAL,
-                status TEXT DEFAULT 'pending',  -- pending/win/loss/push/ungraded/duplicate
+                status TEXT DEFAULT 'pending',  -- pending/win/loss/push/ungraded/notfound/duplicate
                 actual REAL, profit REAL DEFAULT 0,
                 source TEXT DEFAULT 'channel'   -- channel/manual
             )
         """)
         play_cols = _columns(c, "plays")
-        for col, ddl in (("guild_id", "TEXT"), ("source", "TEXT DEFAULT 'channel'")):
+        for col, ddl in (("guild_id", "TEXT"), ("source", "TEXT DEFAULT 'channel'"),
+                         ("note", "TEXT")):
             if col not in play_cols:
                 c.execute(f"ALTER TABLE plays ADD COLUMN {col} {ddl}")
                 log.info("plays: added column %s", col)
@@ -236,16 +238,17 @@ def get_config(guild_id, key):
 
 
 def configured_pairs():
-    """Every (guild_id, sport) with a picks channel set."""
+    """Every (guild_id, sport) that has EITHER a picks channel (scan mode) or a
+    recap channel (form mode -- /play is the only input, nothing to scan)."""
     with _conn() as c:
-        rows = c.execute("SELECT guild_id, key FROM config "
-                         "WHERE key LIKE 'picks_channel_%'").fetchall()
-    out = []
+        rows = c.execute("SELECT guild_id, key FROM config WHERE key LIKE 'picks_channel_%' "
+                         "OR key LIKE 'recap_channel_%'").fetchall()
+    out = set()
     for r in rows:
-        sport = r["key"].replace("picks_channel_", "")
+        sport = re.sub(r"^(picks|recap)_channel_", "", r["key"])
         if sport in SPORTS:
-            out.append((r["guild_id"], sport))
-    return out
+            out.add((r["guild_id"], sport))
+    return sorted(out)
 
 
 # ---------------------------------------------------------------- parsing
@@ -267,6 +270,14 @@ PLAY_RE = re.compile(
 
 # American price sitting in the trailing book noise: "FD -115", "+150"
 ODDS_RE = re.compile(r"(?<![\d.])([+-]\d{3,})(?!\d)")
+
+# "+ 4 Rebounds", "+ 30 PRA", "+1H": a second leg. "+150" (a price) is not.
+MULTILEG_RE = re.compile(r"\+\s*\.?\d{1,2}(?!\d)|\s\+\s*[A-Za-z]{2,}")
+
+
+def is_multileg(text: str) -> bool:
+    t = re.sub(r"h\+r\+rbi|p\+r\+a|p\+r\b|p\+a\b|r\+a\b|rush\s*\+\s*receiving", "", (text or "").lower())
+    return bool(MULTILEG_RE.search(t))
 
 
 def payout_from_odds(risk: float, odds: int) -> float:
@@ -351,22 +362,60 @@ def play_fingerprint(play: dict) -> tuple:
 
 
 def find_duplicate(guild_id, sport, date_str, play):
-    """Returns the existing counted row for this play, or None."""
-    fp = play_fingerprint(play)
+    """Returns the existing counted row for this play, or None.
+    Name comparison is spelling-tolerant: re-logging 'Napheesa' after a typo'd
+    'Naphessa' is the SAME bet, and must never become a second row."""
     with _conn() as c:
-        rows = c.execute(
+        rows = [dict(r) for r in c.execute(
             "SELECT * FROM plays WHERE guild_id=? AND sport=? AND post_date=? "
             "AND status != 'duplicate' AND player IS NOT NULL",
-            (str(guild_id), sport, date_str)).fetchall()
-    for r in rows:
-        if (_norm(r["player"]), r["market"], r["point"], r["side"]) == fp:
-            return dict(r)
+            (str(guild_id), sport, date_str)).fetchall()]
+    same_bet = [r for r in rows
+                if r["market"] == play["market"] and r["point"] == float(play["point"])
+                and r["side"] == play["side"]]
+    if not same_bet:
+        return None
+    exact = [r for r in same_bet if _norm(r["player"]) == _norm(play["player"])]
+    if exact:
+        return exact[0]
+    matched, _ = best_name_match(play["player"], [r["player"] for r in same_bet])
+    if matched is not None:
+        return next(r for r in same_bet if r["player"] == matched)
     return None
 
 
 # ---------------------------------------------------------------- MLB grading
 def _norm(name: str) -> str:
     return re.sub(r"[^a-z]", "", (name or "").lower())
+
+
+def _name_parts(n: str):
+    p = re.sub(r"[^a-z ]", " ", (n or "").lower()).split()
+    return (p[0][:1] if p else "", p[-1] if p else "")
+
+
+def best_name_match(want: str, names, cutoff: float = 0.84):
+    """Match a typed name to a real roster name. Returns (match, suggestions).
+    Tolerates spelling slips ('Naphessa' -> 'Napheesa') but never guesses
+    between two plausible people -- ambiguity returns no match + suggestions."""
+    wn = _norm(want)
+    if not wn or not names:
+        return None, []
+    exact = [n for n in names if _norm(n) == wn]
+    if exact:
+        return exact[0], []
+    sub = [n for n in names if wn in _norm(n) or _norm(n) in wn]
+    if len(sub) == 1:
+        return sub[0], []
+    initial_last = [n for n in names if _name_parts(n) == _name_parts(want)]
+    if len(initial_last) == 1:
+        return initial_last[0], []
+    scored = sorted(((difflib.SequenceMatcher(None, wn, _norm(n)).ratio(), n)
+                     for n in names), reverse=True)
+    if scored and scored[0][0] >= cutoff and (
+            len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.05):
+        return scored[0][1], []
+    return None, [n for r, n in scored[:3] if r >= 0.55]
 
 
 def _final_game_pks(date_str: str) -> list:
@@ -380,13 +429,24 @@ def _final_game_pks(date_str: str) -> list:
     return pks
 
 
+def _boxscore_names(box: dict):
+    out = []
+    for team_side in ("home", "away"):
+        players = (box.get("teams", {}).get(team_side, {}) or {}).get("players", {})
+        for p in players.values():
+            full = (p.get("person") or {}).get("fullName", "")
+            if full:
+                out.append(full)
+    return out
+
+
 def _find_stat_in_boxscore(box: dict, player_name: str, group: str, field: str):
     want = _norm(player_name)
     for team_side in ("home", "away"):
         players = (box.get("teams", {}).get(team_side, {}) or {}).get("players", {})
         for p in players.values():
             full = (p.get("person") or {}).get("fullName", "")
-            if _norm(full) != want and want not in _norm(full):
+            if _norm(full) != want:
                 continue
             stats = (p.get("stats") or {}).get(group) or {}
             if not stats:
@@ -411,12 +471,22 @@ def grade_mlb_play(play: dict, date_str: str, boxscore_cache: dict):
     try:
         if "pks" not in boxscore_cache:
             boxscore_cache["pks"] = _final_game_pks(date_str)
+        all_names = []
         for pk in boxscore_cache["pks"]:
             if pk not in boxscore_cache:
                 r = requests.get(f"{MLB_BASE}/game/{pk}/boxscore", timeout=20)
                 r.raise_for_status()
                 boxscore_cache[pk] = r.json()
-            actual = _find_stat_in_boxscore(boxscore_cache[pk], play["player"], group, field)
+            all_names.extend(_boxscore_names(boxscore_cache[pk]))
+        matched, suggestions = best_name_match(play["player"], all_names)
+        if matched is None:
+            if boxscore_cache["pks"]:
+                return "notfound", suggestions
+            return "pending", None
+        if _norm(matched) != _norm(play["player"]):
+            log.info("name match: %r -> %r", play["player"], matched)
+        for pk in boxscore_cache["pks"]:
+            actual = _find_stat_in_boxscore(boxscore_cache[pk], matched, group, field)
             if actual is not None:
                 if actual == play["point"]:
                     return "push", actual
@@ -454,6 +524,17 @@ def _wnba_completed_events(date_str: str) -> list:
     return out
 
 
+def _wnba_names(summary: dict):
+    out = []
+    for team in (summary.get("boxscore") or {}).get("players", []):
+        for block in team.get("statistics", []):
+            for ath in block.get("athletes", []):
+                full = ((ath.get("athlete") or {}).get("displayName", ""))
+                if full:
+                    out.append(full)
+    return out
+
+
 def _wnba_player_stats(summary: dict, player_name: str):
     want = _norm(player_name)
     for team in (summary.get("boxscore") or {}).get("players", []):
@@ -461,7 +542,7 @@ def _wnba_player_stats(summary: dict, player_name: str):
             labels = block.get("labels") or block.get("names") or []
             for ath in block.get("athletes", []):
                 full = ((ath.get("athlete") or {}).get("displayName", ""))
-                if _norm(full) != want and want not in _norm(full):
+                if _norm(full) != want:
                     continue
                 vals = ath.get("stats") or []
                 if not vals:
@@ -490,12 +571,22 @@ def grade_wnba_play(play: dict, date_str: str, cache: dict):
     try:
         if "events" not in cache:
             cache["events"] = _wnba_completed_events(date_str)
+        all_names = []
         for ev_id in cache["events"]:
             if ev_id not in cache:
                 r = requests.get(f"{ESPN_WNBA}/summary", params={"event": ev_id}, timeout=20)
                 r.raise_for_status()
                 cache[ev_id] = r.json()
-            stats = _wnba_player_stats(cache[ev_id], play["player"])
+            all_names.extend(_wnba_names(cache[ev_id]))
+        matched, suggestions = best_name_match(play["player"], all_names)
+        if matched is None:
+            if cache["events"]:
+                return "notfound", suggestions
+            return "pending", None
+        if _norm(matched) != _norm(play["player"]):
+            log.info("name match: %r -> %r", play["player"], matched)
+        for ev_id in cache["events"]:
+            stats = _wnba_player_stats(cache[ev_id], matched)
             if stats is None:
                 continue
             if isinstance(mk, tuple):
@@ -588,6 +679,242 @@ class ConfirmReset(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="Cancelled — nothing deleted.", view=self)
+        self.stop()
+
+
+BET_RE = re.compile(
+    r"^\s*(?P<side>over|under|o|u)\s*(?P<point>\d+(?:\.\d+)?|\.\d+)\s+(?P<market>.+)$",
+    re.IGNORECASE)
+
+
+def parse_bet(raw: str):
+    """'under 21.5 points' -> side/point/market. Returns None if unreadable."""
+    m = BET_RE.match(raw or "")
+    if not m:
+        return None
+    market = extract_market(m.group("market"))
+    if not market:
+        return None
+    side = m.group("side").lower()
+    return ("Over" if side in ("over", "o") else "Under", float(m.group("point")), market)
+
+
+def parse_odds_input(raw: str):
+    """American odds must carry their sign -- '110' is ambiguous (+110 vs -110)
+    and a wrong guess silently corrupts the payout, so it's rejected."""
+    t = re.sub(r"\s+", "", (raw or "")).lower()
+    if t in ("even", "ev", "evens", "pk"):
+        return 100
+    m = re.fullmatch(r"([+-])(\d{3,5})", t)
+    if not m:
+        return None
+    val = int(m.group(2))
+    if val < 100:
+        return None
+    return val if m.group(1) == "+" else -val
+
+
+class PlayModal(discord.ui.Modal):
+    """Structured input. Nothing is stored unless every field validates, so a
+    typo can't quietly become a missing play."""
+
+    def __init__(self, sport: str, date_str: str, guild_id: int):
+        super().__init__(title=f"Log a {sport} play")
+        self.sport, self.date_str, self.guild_id = sport, date_str, str(guild_id)
+        self.player = discord.ui.TextInput(
+            label="Player", placeholder="A\u2019ja Wilson", max_length=80)
+        self.bet = discord.ui.TextInput(
+            label="Bet", placeholder="under 21.5 points", max_length=80)
+        self.odds = discord.ui.TextInput(
+            label="Odds (sign required)", placeholder="-115  or  +150", max_length=10)
+        self.units = discord.ui.TextInput(
+            label="Units risked", placeholder="1", max_length=10)
+        self.team = discord.ui.TextInput(
+            label="Team (optional)", placeholder="Aces", required=False, max_length=40)
+        for item in (self.player, self.bet, self.odds, self.units, self.team):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        problems = []
+        bet = parse_bet(str(self.bet))
+        if bet is None:
+            problems.append("**Bet** — use `over 21.5 points` / `under 5.5 k's`")
+        odds = parse_odds_input(str(self.odds))
+        if odds is None:
+            problems.append("**Odds** — needs a sign: `-115` or `+150` (or `even`)")
+        try:
+            risk = float(str(self.units).lower().replace("u", "").strip())
+            if risk <= 0:
+                raise ValueError
+        except ValueError:
+            risk = None
+            problems.append("**Units risked** — a positive number like `1` or `0.5`")
+        if problems:
+            await interaction.response.send_message(
+                "❌ Nothing logged — fix and run `/play` again:\n• " + "\n• ".join(problems),
+                ephemeral=True)
+            return
+
+        side, point, market = bet
+        to_win = round(payout_from_odds(risk, odds), 4)
+        play = {"player": str(self.player).strip(), "team": str(self.team).strip() or "—",
+                "side": side, "point": point, "market": market,
+                "risk": risk, "to_win": to_win}
+
+        dupe = find_duplicate(self.guild_id, self.sport, self.date_str, play)
+        if dupe:
+            await interaction.response.send_message(
+                f"⚠️ Already logged for {self.date_str}: **{dupe['player']} {dupe['side']} "
+                f"{dupe['point']:g} {dupe['market']}** (status: {dupe['status']}). "
+                f"Nothing added — one play, counted once.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        mid = f"form-{interaction.id}"
+        with _conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO plays (message_id, guild_id, sport, post_date, raw, player, "
+                "team, side, point, market, risk, to_win, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'form')",
+                (mid, self.guild_id, self.sport, self.date_str,
+                 f"{risk:g}u @ {odds:+d}: {play['player']} ({play['team']}) {side} {point:g} {market}",
+                 play["player"], play["team"], side, point, market, risk, to_win))
+
+        verdict = "stored as pending"
+        if self.sport in GRADED_SPORTS:
+            status, actual = await asyncio.to_thread(
+                GRADERS[self.sport], play, self.date_str, {})
+            profit = settle(risk, to_win, status)
+            with _conn() as c:
+                c.execute("UPDATE plays SET status=?, actual=?, profit=? WHERE message_id=?",
+                          (status, actual, profit, mid))
+            if status in COUNTED:
+                act = f" (actual: {actual:g})" if actual is not None else ""
+                verdict = f"graded **{status}**{act} — {profit:+.2f}u"
+            elif status == "ungraded":
+                verdict = f"stored, but I don't grade `{market}` yet — it'll show as couldn't-grade"
+            else:
+                verdict = "stored as pending (game not final or player not found yet)"
+
+        await interaction.followup.send(
+            f"✅ **{self.sport}** logged for **{self.date_str}**\n"
+            f"{play['player']} ({play['team']}) {side} {point:g} {market}\n"
+            f"Risk **{risk:g}u** at **{odds:+d}** → to win **{to_win:g}u** "
+            f"({'+' if odds > 0 else ''}{odds}: {'risk × ' + format(odds / 100, 'g') if odds > 0 else '100 ÷ ' + str(abs(odds)) + ' × risk'})\n"
+            f"{verdict}", ephemeral=True)
+
+
+class RemovePlayView(discord.ui.View):
+    """Pick one play out of a day and delete it. Scoped to this server."""
+
+    def __init__(self, user_id: int, guild_id, sport: str, date_str: str, rows):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.guild_id = str(guild_id)
+        self.sport = sport
+        self.date_str = date_str
+        options = []
+        for r in rows[:25]:
+            units = (f"{r['profit']:+.2f}u" if r["profit"] is not None else "no units")
+            label = f"{r['player']} {r['side']} {r['point']:g} {r['market']}"[:100]
+            options.append(discord.SelectOption(
+                label=label, value=str(r["message_id"]),
+                description=f"{r['status']} · {units} · {r.get('source') or 'channel'}"[:100]))
+        self.select = discord.ui.Select(placeholder="Pick the play to delete", options=options)
+        self.select.callback = self._on_pick
+        self.add_item(self.select)
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Not your menu.", ephemeral=True)
+            return
+        mid = self.select.values[0]
+        with _conn() as c:
+            row = c.execute("SELECT * FROM plays WHERE message_id=? AND guild_id=?",
+                            (mid, self.guild_id)).fetchone()
+            if row is None:
+                await interaction.response.send_message("That play is already gone.", ephemeral=True)
+                return
+            row = dict(row)
+            c.execute("DELETE FROM plays WHERE message_id=? AND guild_id=?", (mid, self.guild_id))
+        w, l, pu, profit, risked, _ = ledger_totals(self.guild_id, self.sport)
+        roi = f"{profit / risked * 100:+.2f}%" if risked else "—"
+        log.warning("Removed play %s (%s %s %g %s, %s) from guild %s by %s",
+                    mid, row["player"], row["side"], row["point"], row["market"],
+                    row["status"], self.guild_id, interaction.user)
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content=(f"🗑️ Removed **{row['player']} {row['side']} {row['point']:g} "
+                     f"{row['market']}** ({row['status']}) from {self.date_str}.\n"
+                     f"**{self.sport} YTD now:** {w}-{l}"
+                     + (f"-{pu}" if pu else "")
+                     + f" | {profit:+.2f}u | ROI {roi}"), view=self)
+        self.stop()
+
+
+class GradeVerdictView(discord.ui.View):
+    def __init__(self, user_id, guild_id, sport, row):
+        super().__init__(timeout=60)
+        self.user_id, self.guild_id, self.sport, self.row = user_id, str(guild_id), sport, row
+
+    async def _set(self, interaction, status):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Not your menu.", ephemeral=True); return
+        r = self.row
+        profit = settle(r["risk"], r["to_win"], status) if status != "pending" else 0
+        note = None if status == "pending" else f"manually graded by {interaction.user.display_name}"
+        with _conn() as c:
+            c.execute("UPDATE plays SET status=?, profit=?, actual=NULL, note=? WHERE message_id=? AND guild_id=?",
+                      (status, profit, note, r["message_id"], self.guild_id))
+        w,l,pu,prof,risked,unpriced = ledger_totals(self.guild_id, self.sport)
+        roi = f"{prof/risked*100:+.2f}%" if risked else "—"
+        log.warning("Manual grade: %s %s %g %s -> %s by %s (guild %s)",
+                    r["player"], r["side"], r["point"], r["market"], status, interaction.user, self.guild_id)
+        for ch in self.children: ch.disabled = True
+        units = (f"{profit:+.2f}u" if profit is not None else "units unknown (no price)")
+        await interaction.response.edit_message(
+            content=(f"🖐️ **{r['player']} {r['side']} {r['point']:g} {r['market']}** set to "
+                     f"**{status}** ({units}).\n**{self.sport} YTD now:** {w}-{l}"
+                     + (f"-{pu}" if pu else "") + f" | {prof:+.2f}u | ROI {roi}\n"
+                     f"Run `/recapnow` for that date to repost the corrected recap."), view=self)
+        self.stop()
+
+    @discord.ui.button(label="Win ✅", style=discord.ButtonStyle.success)
+    async def w(self, i, b): await self._set(i, "win")
+    @discord.ui.button(label="Loss ❌", style=discord.ButtonStyle.danger)
+    async def l(self, i, b): await self._set(i, "loss")
+    @discord.ui.button(label="Push ➖", style=discord.ButtonStyle.secondary)
+    async def p(self, i, b): await self._set(i, "push")
+    @discord.ui.button(label="Back to pending ⏳", style=discord.ButtonStyle.secondary)
+    async def pend(self, i, b): await self._set(i, "pending")
+
+
+class GradePickView(discord.ui.View):
+    def __init__(self, user_id, guild_id, sport, date_str, rows):
+        super().__init__(timeout=60)
+        self.user_id, self.guild_id, self.sport, self.date_str = user_id, str(guild_id), sport, date_str
+        self.rows = {str(r["message_id"]): r for r in rows[:25]}
+        opts = []
+        for r in rows[:25]:
+            units = (f"{r['profit']:+.2f}u" if r["profit"] is not None else "no units")
+            opts.append(discord.SelectOption(
+                label=f"{r['player']} {r['side']} {r['point']:g} {r['market']}"[:100],
+                value=str(r["message_id"]),
+                description=f"currently {r['status']} · {units}"[:100]))
+        self.sel = discord.ui.Select(placeholder="Pick the play to re-grade", options=opts)
+        self.sel.callback = self._pick
+        self.add_item(self.sel)
+
+    async def _pick(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Not your menu.", ephemeral=True); return
+        r = self.rows[self.sel.values[0]]
+        await interaction.response.edit_message(
+            content=(f"**{r['player']} {r['side']} {r['point']:g} {r['market']}** "
+                     f"({self.date_str}, currently **{r['status']}**, risk {r['risk']:g}u"
+                     + (f" to win {r['to_win']:g}u" if r["to_win"] is not None else "")
+                     + ") — set the real result:"),
+            view=GradeVerdictView(self.user_id, self.guild_id, self.sport, r))
         self.stop()
 
 
@@ -693,6 +1020,13 @@ class RecapBot(discord.Client):
                     ephemeral=True)
                 return
 
+            if is_multileg(play):
+                await interaction.response.send_message(
+                    "⚠️ That's a multi-leg (SGP) play — I can only auto-grade single props, and "
+                    "grading just the first leg would fake the result. Log it with `/play` or "
+                    "`/logplay` as-is and it'll sit in *couldn't grade* until you settle it with "
+                    "`/grade` — or log only the leg you want tracked.", ephemeral=True)
+                return
             dupe = find_duplicate(interaction.guild_id, sport.value, date_str, parsed)
             if dupe:
                 await interaction.response.send_message(
@@ -726,6 +1060,9 @@ class RecapBot(discord.Client):
                     act = f" (actual: {actual:g})" if actual is not None else ""
                     units = f"{profit:+.2f}u" if profit is not None else "units unknown (no price posted)"
                     verdict = f"graded **{status}**{act} — {units}"
+                elif status == "notfound":
+                    hint = ("did you mean " + ", ".join(actual)) if actual else "no player by that name played"
+                    verdict = f"⚠️ **no player named `{parsed['player']}` in that day's box scores** — {hint}"
                 elif status == "ungraded":
                     verdict = "stored, but I don't know that market — it'll show as couldn't-grade"
                 else:
@@ -791,6 +1128,130 @@ class RecapBot(discord.Client):
             name="record",
             description="Show this server's season record, units and ROI for a sport",
             callback=_record))
+
+        # ---- /play  (structured input -- the bot does the odds math)
+        @app_commands.choices(sport=sport_choices)
+        @app_commands.describe(date="Optional: YYYY-MM-DD or MM/DD for a past day. Defaults to today.")
+        async def _play(interaction: discord.Interaction,
+                        sport: app_commands.Choice[str],
+                        date: str = None):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("Admin only.", ephemeral=True)
+                return
+            date_str = parse_date_arg(date) if date else _et_date_str(0)
+            if date_str is None:
+                await interaction.response.send_message(
+                    f"Couldn't read the date `{date}`. Use YYYY-MM-DD or MM/DD.", ephemeral=True)
+                return
+            if date_str > _et_date_str(0):
+                await interaction.response.send_message(
+                    f"{date_str} is in the future — nothing to grade.", ephemeral=True)
+                return
+            await interaction.response.send_modal(
+                PlayModal(sport.value, date_str, interaction.guild_id))
+
+        self.tree.add_command(app_commands.Command(
+            name="play",
+            description="Log a play in a form — you enter the odds, the bot does the unit math",
+            callback=_play))
+
+        # ---- /grade
+        @app_commands.choices(sport=sport_choices)
+        @app_commands.describe(date="Optional: YYYY-MM-DD or MM/DD. Defaults to today.")
+        async def _grade(interaction: discord.Interaction,
+                         sport: app_commands.Choice[str],
+                         date: str = None):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("Admin only.", ephemeral=True)
+                return
+            date_str = parse_date_arg(date) if date else _et_date_str(0)
+            if date_str is None:
+                await interaction.response.send_message(
+                    f"Couldn't read the date `{date}`. Use YYYY-MM-DD or MM/DD.", ephemeral=True)
+                return
+            with _conn() as c:
+                rows = [dict(r) for r in c.execute(
+                    "SELECT * FROM plays WHERE guild_id=? AND sport=? AND post_date=? "
+                    "AND player IS NOT NULL ORDER BY player",
+                    (str(interaction.guild_id), sport.value, date_str)).fetchall()]
+            if not rows:
+                await interaction.response.send_message(
+                    f"No {sport.value} plays stored for {date_str} in this server.", ephemeral=True)
+                return
+            await interaction.response.send_message(
+                f"**{sport.value} plays on {date_str}** — pick one, then set the real result. "
+                f"Manual grades show a 🖐️ in the recap.",
+                view=GradePickView(interaction.user.id, interaction.guild_id, sport.value, date_str, rows),
+                ephemeral=True)
+
+        self.tree.add_command(app_commands.Command(
+            name="grade",
+            description="ADMIN: overrule a play's result (for SGPs and bad grades)",
+            callback=_grade))
+
+        # ---- /removeplay
+        @app_commands.choices(sport=sport_choices)
+        @app_commands.describe(date="Optional: YYYY-MM-DD or MM/DD. Defaults to today.")
+        async def _removeplay(interaction: discord.Interaction,
+                              sport: app_commands.Choice[str],
+                              date: str = None):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("Admin only.", ephemeral=True)
+                return
+            date_str = parse_date_arg(date) if date else _et_date_str(0)
+            if date_str is None:
+                await interaction.response.send_message(
+                    f"Couldn't read the date `{date}`. Use YYYY-MM-DD or MM/DD.", ephemeral=True)
+                return
+            with _conn() as c:
+                rows = [dict(r) for r in c.execute(
+                    "SELECT * FROM plays WHERE guild_id=? AND sport=? AND post_date=? "
+                    "AND player IS NOT NULL ORDER BY player",
+                    (str(interaction.guild_id), sport.value, date_str)).fetchall()]
+            if not rows:
+                await interaction.response.send_message(
+                    f"No {sport.value} plays stored for {date_str} in this server.", ephemeral=True)
+                return
+            more = f"\n(showing first 25 of {len(rows)})" if len(rows) > 25 else ""
+            await interaction.response.send_message(
+                f"**{sport.value} plays on {date_str}** — pick one to delete. "
+                f"This can't be undone.{more}",
+                view=RemovePlayView(interaction.user.id, interaction.guild_id,
+                                    sport.value, date_str, rows),
+                ephemeral=True)
+
+        self.tree.add_command(app_commands.Command(
+            name="removeplay",
+            description="ADMIN: delete a single play from this server's ledger",
+            callback=_removeplay))
+
+        # ---- /stopscanning
+        @app_commands.choices(sport=sport_choices)
+        async def _stopscanning(interaction: discord.Interaction,
+                                sport: app_commands.Choice[str]):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("Admin only.", ephemeral=True)
+                return
+            existing = get_config(interaction.guild_id, f"picks_channel_{sport.value}")
+            if not existing:
+                await interaction.response.send_message(
+                    f"Not scanning any channel for **{sport.value}** here already.", ephemeral=True)
+                return
+            with _conn() as c:
+                c.execute("DELETE FROM config WHERE guild_id=? AND key=?",
+                          (str(interaction.guild_id), f"picks_channel_{sport.value}"))
+            recap_set = get_config(interaction.guild_id, f"recap_channel_{sport.value}")
+            tail = ("Nightly recaps continue as normal." if recap_set else
+                    "⚠️ No recap channel set for this sport — run /setrecapchannel or recaps stop.")
+            await interaction.response.send_message(
+                f"🛑 Stopped reading messages for **{sport.value}**. `/play` is now the only way "
+                f"in, so your screenshot posts won't show up as couldn't-grade. "
+                f"Plays already stored are untouched. {tail}", ephemeral=True)
+
+        self.tree.add_command(app_commands.Command(
+            name="stopscanning",
+            description="ADMIN: stop reading a sport's channel — /play becomes the only input",
+            callback=_stopscanning))
 
         # ---- /permcheck
         async def _permcheck(interaction: discord.Interaction):
@@ -944,6 +1405,17 @@ async def scan_channel_for_plays(bot, guild_id, sport: str, date_str: str):
                             (str(msg_obj.id), str(guild_id), sport, date_str, raw))
                 continue
 
+            if is_multileg(content):
+                with _conn() as c:
+                    c.execute(
+                        "INSERT OR IGNORE INTO plays (message_id, guild_id, sport, post_date, raw, "
+                        "player, team, side, point, market, risk, to_win, status, note) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'ungraded', ?)",
+                        (str(msg_obj.id), str(guild_id), sport, date_str, content[:300],
+                         play["player"], play["team"], play["side"], play["point"],
+                         play["market"], play["risk"], play["to_win"],
+                         "multi-leg (SGP) — I only read the first leg; grade it with /grade"))
+                continue
             existing = find_duplicate(guild_id, sport, date_str, play)
             status = "duplicate" if (existing and str(existing["message_id"]) != str(msg_obj.id)) else "pending"
             with _conn() as c:
@@ -980,9 +1452,46 @@ def _fit_lines(lines, limit=1024):
     return "\n".join(out) if out else "—"
 
 
-async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
+async def regrade_pending(guild_id, sport: str, skip_date: str, days: int = 4):
+    """Re-grade plays still pending from recent days. A game that finished late,
+    or a stat feed that lagged, would otherwise stay pending forever -- the
+    nightly recap only ever looked at one day."""
+    if sport not in GRADED_SPORTS:
+        return []
+    cutoff = (datetime.strptime(skip_date, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    with _conn() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM plays WHERE guild_id=? AND sport=? AND status='pending' "
+            "AND player IS NOT NULL AND post_date >= ? AND post_date < ?",
+            (str(guild_id), sport, cutoff, skip_date)).fetchall()]
+    resolved = []
+    by_date = {}
+    for r in rows:
+        by_date.setdefault(r["post_date"], []).append(r)
+    for d, day_rows in by_date.items():
+        cache = {}
+        for r in day_rows:
+            status, actual = await asyncio.to_thread(GRADERS[sport], r, d, cache)
+            if status == "pending":
+                continue
+            note = None
+            if status == "notfound":
+                note = ("did you mean " + ", ".join(actual)) if actual else "no player by that name played"
+                actual = None
+            profit = settle(r["risk"], r["to_win"], status)
+            with _conn() as c:
+                c.execute("UPDATE plays SET status=?, actual=?, profit=?, note=? WHERE message_id=?",
+                          (status, actual, profit, note, r["message_id"]))
+            r.update(status=status, actual=actual, profit=profit, note=note)
+            resolved.append(r)
+            log.info("late grade [%s %s]: %s -> %s", sport, d, r["player"], status)
+    return resolved
+
+
+async def run_recap(bot, guild_id, sport: str, date_str: str, sweep: bool = False) -> str:
     guild_id = str(guild_id)
     _, dupes, scan_error = await scan_channel_for_plays(bot, guild_id, sport, date_str)
+    late = await regrade_pending(guild_id, sport, date_str) if sweep else []
 
     with _conn() as c:
         rows = [dict(r) for r in c.execute(
@@ -999,15 +1508,21 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
             if r["status"] != "pending" or not r["player"]:
                 continue
             status, actual = await asyncio.to_thread(grader, r, date_str, cache)
+            note = None
+            if status == "notfound":
+                note = ("did you mean " + ", ".join(actual) if actual else
+                        "no player by that name played that day")
+                actual = None
             profit = settle(r["risk"], r["to_win"], status)
             with _conn() as c:
-                c.execute("UPDATE plays SET status=?, actual=?, profit=? WHERE message_id=?",
-                          (status, actual, profit, r["message_id"]))
-            r.update(status=status, actual=actual, profit=profit)
+                c.execute("UPDATE plays SET status=?, actual=?, profit=?, note=? WHERE message_id=?",
+                          (status, actual, profit, note, r["message_id"]))
+            r.update(status=status, actual=actual, profit=profit, note=note)
 
     graded = [r for r in rows if r["status"] in COUNTED]
     pending = [r for r in rows if r["status"] == "pending"]
     ungraded = [r for r in rows if r["status"] == "ungraded"]
+    notfound = [r for r in rows if r["status"] == "notfound"]
     repeats = [r for r in rows if r["status"] == "duplicate"]
     wins = sum(1 for r in graded if r["status"] == "win")
     losses = sum(1 for r in graded if r["status"] == "loss")
@@ -1028,6 +1543,8 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
         mark = {"win": "✅", "loss": "❌", "push": "➖"}[r["status"]]
         actual = f" (actual: {r['actual']:g})" if r["actual"] is not None else ""
         manual = " 📝" if r.get("source") == "manual" else ""
+        if r.get("note") and "manually graded" in str(r["note"]):
+            manual += " 🖐️"
         units = (f"{r['profit']:+.2f}u" if r["to_win"] is not None
                  else "units unknown (no price posted)")
         lines.append(f"{mark} {r['player']} {r['side']} {r['point']:g} "
@@ -1038,6 +1555,12 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
         embed.add_field(name="⏳ Still pending (game not final / player not found)",
                         value=_fit_lines([f"{r['player']} {r['side']} {r['point']:g} {r['market']}"
                                           for r in pending]), inline=False)
+    if notfound:
+        embed.add_field(
+            name="✏️ Name not found — check spelling",
+            value=_fit_lines([f"{r['player']} {r['side']} {r['point']:g} {r['market']}"
+                              + (f" — {r['note']}" if r["note"] else "") for r in notfound]),
+            inline=False)
     if ungraded:
         embed.add_field(name="🔎 Couldn't grade — check manually",
                         value=_fit_lines([(r["raw"] or "?")[:80] for r in ungraded]), inline=False)
@@ -1045,6 +1568,13 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
         embed.add_field(name="🔁 Repeat posts (counted once)",
                         value=_fit_lines([f"{r['player']} {r['side']} {r['point']:g} {r['market']}"
                                           for r in repeats]), inline=False)
+    if late:
+        embed.add_field(
+            name="⏱️ Late grades (earlier days, now settled)",
+            value=_fit_lines([
+                f"{r['post_date'][5:]} {r['player']} {r['side']} {r['point']:g} {r['market']} — "
+                + (f"{r['profit']:+.2f}u" if r["profit"] is not None else r["status"])
+                for r in late]), inline=False)
     embed.add_field(name="💰 Units YTD", value=f"{ytd:+.2f}u", inline=True)
     if unpriced_today or unpriced_ytd:
         embed.add_field(
@@ -1085,7 +1615,8 @@ async def run_recap(bot, guild_id, sport: str, date_str: str) -> str:
         except discord.Forbidden as e:
             problems.append(f"#{getattr(channel, 'name', cid)} refused the post ({e})")
             continue
-        extra = f", {len(repeats)} repeat" if repeats else ""
+        extra = (f", {len(repeats)} repeat" if repeats else "") + (
+            f", {len(notfound)} name-not-found" if notfound else "")
         fallback = f" — FELL BACK from the recap channel: {'; '.join(problems)}" if problems else ""
         if problems:
             log.error("%s recap for %s: %s", sport, date_str, "; ".join(problems))
@@ -1109,7 +1640,7 @@ async def nightly_recap(bot):
         guild = bot.get_guild(int(guild_id))
         name = guild.name if guild else f"guild {guild_id}"
         try:
-            status = await run_recap(bot, guild_id, sport, date_str)
+            status = await run_recap(bot, guild_id, sport, date_str, sweep=True)
             log.info("[%s] %s nightly recap: %s", name, sport, status)
         except Exception as e:
             log.error("[%s] %s nightly recap failed: %s", name, sport, e)
